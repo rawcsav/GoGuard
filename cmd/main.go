@@ -4,9 +4,11 @@ import (
 	"GoGuard/pkg/detect"
 	"encoding/json"
 	"fmt"
+	"github.com/biter777/countries"
 	"io/ioutil"
 	"log"
 	"net/http"
+	"regexp"
 )
 
 // Mullvad API endpoint for user status
@@ -37,18 +39,32 @@ func VPNStatus() (bool, string, string, string, bool, string, bool, error) {
 	organization, _ := result["organization"].(string)
 	blacklisted, _ := result["blacklisted"].(bool)
 
-	return secure, ip, country, city, mullvadServer, organization, blacklisted, nil
+	// Validate if the country is already a country code
+	countryCode := validateCountry(country)
+
+	return secure, ip, countryCode, city, mullvadServer, organization, blacklisted, nil
+}
+
+// validateCountry checks if the input is a valid country code or converts the country name to a country code
+func validateCountry(country string) string {
+	// Regex to match two-letter country codes
+	re := regexp.MustCompile(`^[A-Z]{2}$`)
+	if re.MatchString(country) {
+		return country
+	}
+	// Convert country name to country code
+	return countries.ByName(country).Alpha2()
 }
 
 // main function to run the application
 func main() {
-	secure, ip, country, city, mullvadServer, organization, blacklisted, err := VPNStatus()
+	secure, ip, countryCode, city, mullvadServer, organization, blacklisted, err := VPNStatus()
 	if err != nil {
 		log.Fatalf("Error checking VPN status: %v", err)
 	}
 
 	fmt.Printf("Current IP: %s\n", ip)
-	fmt.Printf("Country: %s\n", country)
+	fmt.Printf("Country Code: %s\n", countryCode)
 	fmt.Printf("City: %s\n", city)
 	fmt.Printf("Organization: %s\n", organization)
 	if secure {
@@ -67,7 +83,7 @@ func main() {
 		fmt.Println("Your IP is not blacklisted.")
 	}
 
-	bestServer, latency, err := detect.FindBestServer(country)
+	bestServer, latency, err := detect.FindBestServer(countryCode)
 	if err != nil {
 		log.Fatalf("Error finding best server: %v", err)
 	}
