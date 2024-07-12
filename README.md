@@ -11,8 +11,8 @@ This project is currently under development. Features and functionalities are ac
 To run GoGuard, clone the repository and build the application:
 
 ```bash
-git clone https://github.com/yourusername/GoGuard.git
+git clone https://github.com/rawcsav/GoGuard.git
 cd GoGuard
 go build
-./GoGuard
+sudo ./GoGuard
 ```
