@@ -17,10 +17,12 @@ type MullvadServer struct {
 	Hostname    string `json:"hostname"`
 	IPv4AddrIn  string `json:"ipv4_addr_in"`
 	CountryName string `json:"country_name"`
+	Type        string `json:"type"`
 }
 
-func FetchMullvadServers(country string) ([]MullvadServer, error) {
-	url := fmt.Sprintf("https://api.mullvad.net/www/relays/all/?filters={\"country_code\":\"%s\"}", country)
+// FetchAllMullvadServers retrieves all Mullvad servers and filters for WireGuard servers.
+func FetchAllMullvadServers() ([]MullvadServer, error) {
+	url := "https://api.mullvad.net/www/relays/all/"
 	resp, err := http.Get(url)
 	if err != nil {
 		return nil, fmt.Errorf("HTTP request failed: %v", err)
@@ -32,22 +34,25 @@ func FetchMullvadServers(country string) ([]MullvadServer, error) {
 		return nil, fmt.Errorf("failed to read response body: %v", err)
 	}
 
-	// Check if the response starts with '<', indicating HTML
-	if strings.TrimSpace(string(body))[0] == '<' {
-		return nil, fmt.Errorf("received HTML instead of JSON. Response body: %s", string(body[:100])) // Print first 100 characters
-	}
-
 	var servers []MullvadServer
 	err = json.Unmarshal(body, &servers)
 	if err != nil {
-		return nil, fmt.Errorf("JSON unmarshaling failed: %v. Response body: %s", err, string(body[:100]))
+		return nil, fmt.Errorf("JSON unmarshaling failed: %v", err)
 	}
 
-	if len(servers) == 0 {
-		return nil, fmt.Errorf("no servers found for country: %s", country)
+	// Filter to keep only WireGuard servers
+	var wireguardServers []MullvadServer
+	for _, server := range servers {
+		if strings.ToLower(server.Type) == "wireguard" {
+			wireguardServers = append(wireguardServers, server)
+		}
 	}
 
-	return servers, nil
+	if len(wireguardServers) == 0 {
+		return nil, fmt.Errorf("no WireGuard servers found")
+	}
+
+	return wireguardServers, nil
 }
 
 // TCPPing performs a TCP ping to measure latency.
@@ -61,37 +66,33 @@ func TCPPing(ip string, port int) (time.Duration, error) {
 	return time.Since(start), nil
 }
 
-// FindBestServer finds the Mullvad server with the lowest latency.
-func FindBestServer(country string) (*MullvadServer, time.Duration, error) {
-	servers, err := FetchMullvadServers(country)
+// ServerLatency represents a server and its measured latency.
+type ServerLatency struct {
+	Server  MullvadServer
+	Latency time.Duration
+}
+
+// FindBestServer finds the Mullvad WireGuard server with the lowest latency.
+func FindBestServer() (*MullvadServer, time.Duration, error) {
+	servers, err := FetchAllMullvadServers()
 	if err != nil {
 		return nil, 0, err
-	}
-
-	type ServerLatency struct {
-		Server  MullvadServer
-		Latency time.Duration
 	}
 
 	results := make(chan ServerLatency)
 	var wg sync.WaitGroup
 	totalServers := len(servers)
-	pingedServers := 0
-	mu := &sync.Mutex{}
+	fmt.Printf("Pinging %d servers\n", totalServers)
 
 	for _, server := range servers {
 		wg.Add(1)
 		go func(server MullvadServer) {
 			defer wg.Done()
-			latency, err := TCPPing(server.IPv4AddrIn, 443) // Use HTTPS port
-			mu.Lock()
-			pingedServers++
-			fmt.Printf("Pinged %d/%d servers\n", pingedServers, totalServers)
-			mu.Unlock()
+			latency, err := TCPPing(server.IPv4AddrIn, 443) // WireGuard typically uses port 51820
 			if err != nil {
-				fmt.Printf("Error pinging server %s (%s): %v\n", server.Hostname, server.IPv4AddrIn, err)
 				return
 			}
+
 			results <- ServerLatency{Server: server, Latency: latency}
 		}(server)
 	}

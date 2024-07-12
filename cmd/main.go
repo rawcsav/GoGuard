@@ -56,7 +56,6 @@ func validateCountry(country string) string {
 	return countries.ByName(country).Alpha2()
 }
 
-// main function to run the application
 func main() {
 	secure, ip, countryCode, city, mullvadServer, organization, blacklisted, err := VPNStatus()
 	if err != nil {
@@ -83,7 +82,7 @@ func main() {
 		fmt.Println("Your IP is not blacklisted.")
 	}
 
-	bestServer, latency, err := detect.FindBestServer(countryCode)
+	bestServer, latency, err := detect.FindBestServer()
 	if err != nil {
 		log.Fatalf("Error finding best server: %v", err)
 	}
