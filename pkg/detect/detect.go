@@ -20,7 +20,6 @@ type MullvadServer struct {
 	Type        string `json:"type"`
 }
 
-// FetchAllMullvadServers retrieves all Mullvad servers and filters for WireGuard servers.
 func FetchAllMullvadServers() ([]MullvadServer, error) {
 	url := "https://api.mullvad.net/www/relays/all/"
 	resp, err := http.Get(url)
@@ -55,10 +54,14 @@ func FetchAllMullvadServers() ([]MullvadServer, error) {
 	return wireguardServers, nil
 }
 
-// TCPPing performs a TCP ping to measure latency.
+type ServerLatency struct {
+	Server  MullvadServer
+	Latency time.Duration
+}
+
 func TCPPing(ip string, port int) (time.Duration, error) {
 	start := time.Now()
-	conn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", ip, port), 2*time.Second)
+	conn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", ip, port), 500*time.Millisecond)
 	if err != nil {
 		return 0, err
 	}
@@ -66,29 +69,27 @@ func TCPPing(ip string, port int) (time.Duration, error) {
 	return time.Since(start), nil
 }
 
-// ServerLatency represents a server and its measured latency.
-type ServerLatency struct {
-	Server  MullvadServer
-	Latency time.Duration
-}
-
-// FindBestServer finds the Mullvad WireGuard server with the lowest latency.
+// FindBestServer finds the Mullvad WireGuard server with the lowest latency
 func FindBestServer() (*MullvadServer, time.Duration, error) {
 	servers, err := FetchAllMullvadServers()
 	if err != nil {
 		return nil, 0, err
 	}
 
-	results := make(chan ServerLatency)
+	results := make(chan ServerLatency, len(servers))
 	var wg sync.WaitGroup
-	totalServers := len(servers)
-	fmt.Printf("Pinging %d servers\n", totalServers)
+
+	// Increase concurrent goroutines, but still limit them
+	semaphore := make(chan struct{}, 50)
 
 	for _, server := range servers {
 		wg.Add(1)
 		go func(server MullvadServer) {
 			defer wg.Done()
-			latency, err := TCPPing(server.IPv4AddrIn, 443) // WireGuard typically uses port 51820
+			semaphore <- struct{}{}
+			defer func() { <-semaphore }()
+
+			latency, err := TCPPing(server.IPv4AddrIn, 443)
 			if err != nil {
 				return
 			}
@@ -107,13 +108,48 @@ func FindBestServer() (*MullvadServer, time.Duration, error) {
 		serverLatencies = append(serverLatencies, result)
 	}
 
+	if len(serverLatencies) == 0 {
+		return nil, 0, fmt.Errorf("no servers were successfully pinged")
+	}
+
 	sort.Slice(serverLatencies, func(i, j int) bool {
 		return serverLatencies[i].Latency < serverLatencies[j].Latency
 	})
 
-	if len(serverLatencies) > 0 {
-		bestServer := serverLatencies[0]
-		return &bestServer.Server, bestServer.Latency, nil
+	// Take the top 10% of servers and perform additional pings
+	topServers := int(float64(len(serverLatencies)) * 0.1)
+	if topServers < 5 {
+		topServers = 5 // Ensure at least 5 servers for the second round
 	}
-	return nil, 0, fmt.Errorf("no servers were successfully pinged")
+
+	var finalResults []ServerLatency
+	for i := 0; i < topServers && i < len(serverLatencies); i++ {
+		server := serverLatencies[i].Server
+		totalLatency := time.Duration(0)
+		successfulPings := 0
+
+		for j := 0; j < 3; j++ {
+			latency, err := TCPPing(server.IPv4AddrIn, 443)
+			if err == nil {
+				totalLatency += latency
+				successfulPings++
+			}
+		}
+
+		if successfulPings > 0 {
+			avgLatency := totalLatency / time.Duration(successfulPings)
+			finalResults = append(finalResults, ServerLatency{Server: server, Latency: avgLatency})
+		}
+	}
+
+	if len(finalResults) == 0 {
+		return nil, 0, fmt.Errorf("no servers passed the final ping test")
+	}
+
+	sort.Slice(finalResults, func(i, j int) bool {
+		return finalResults[i].Latency < finalResults[j].Latency
+	})
+
+	bestServer := finalResults[0]
+	return &bestServer.Server, bestServer.Latency, nil
 }
