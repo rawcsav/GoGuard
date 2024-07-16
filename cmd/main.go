@@ -1,92 +1,101 @@
 package main
 
 import (
-	"GoGuard/pkg/detect"
-	"encoding/json"
-	"fmt"
-	"github.com/biter777/countries"
-	"io/ioutil"
+	config2 "GoGuard/pkg/config"
+	"GoGuard/pkg/network"
+	"GoGuard/pkg/vpn"
+	"flag"
+	"github.com/joho/godotenv"
 	"log"
-	"net/http"
-	"regexp"
+	"path/filepath"
+	"strings"
 )
 
-// Mullvad API endpoint for user status
-const mullvadStatusAPI = "https://am.i.mullvad.net/json"
-
-// VPNStatus checks the current VPN status using Mullvad's API
-func VPNStatus() (bool, string, string, string, bool, string, bool, error) {
-	resp, err := http.Get(mullvadStatusAPI)
-	if err != nil {
-		return false, "", "", "", false, "", false, err
-	}
-	defer resp.Body.Close()
-
-	body, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		return false, "", "", "", false, "", false, err
-	}
-
-	var result map[string]interface{}
-	json.Unmarshal(body, &result)
-
-	// Safely assert types, checking for nil values
-	secure, _ := result["mullvad_exit_ip"].(bool)
-	ip, _ := result["ip"].(string)
-	country, _ := result["country"].(string)
-	city, _ := result["city"].(string)
-	mullvadServer, _ := result["mullvad_server"].(bool)
-	organization, _ := result["organization"].(string)
-	blacklisted, _ := result["blacklisted"].(bool)
-
-	// Validate if the country is already a country code
-	countryCode := validateCountry(country)
-
-	return secure, ip, countryCode, city, mullvadServer, organization, blacklisted, nil
-}
-
-// validateCountry checks if the input is a valid country code or converts the country name to a country code
-func validateCountry(country string) string {
-	// Regex to match two-letter country codes
-	re := regexp.MustCompile(`^[A-Z]{2}$`)
-	if re.MatchString(country) {
-		return country
-	}
-	// Convert country name to country code
-	return countries.ByName(country).Alpha2()
-}
-
 func main() {
-	secure, ip, countryCode, city, mullvadServer, organization, blacklisted, err := VPNStatus()
+	// Load environment variables from .env file
+	err := godotenv.Load(filepath.Join("../", ".env"))
 	if err != nil {
-		log.Fatalf("Error checking VPN status: %v", err)
+		log.Println("No .env file found")
 	}
 
-	fmt.Printf("Current IP: %s\n", ip)
-	fmt.Printf("Country Code: %s\n", countryCode)
-	fmt.Printf("City: %s\n", city)
-	fmt.Printf("Organization: %s\n", organization)
-	if secure {
-		fmt.Println("Your connection is secure.")
-	} else {
-		fmt.Println("Your connection is NOT secure.")
-	}
-	if mullvadServer {
-		fmt.Println("You are connected to a Mullvad server.")
-	} else {
-		fmt.Println("You are NOT connected to a Mullvad server.")
-	}
-	if blacklisted {
-		fmt.Println("Your IP is blacklisted.")
-	} else {
-		fmt.Println("Your IP is not blacklisted.")
-	}
+	multihop := flag.Bool("m", false, "Enable multihop (2 hops)")
+	server := flag.String("s", "", "WireGuard server to connect to (e.g., se-mma-wg-001)")
+	killSwitch := flag.Bool("k", false, "Enable kill switch")
+	localNet := flag.String("l", "", "Local network CIDR for sharing (e.g., 192.168.1.0/24)")
+	socks5 := flag.Bool("p", false, "Use SOCKS5 proxy for additional hop")
+	autoStart := flag.Bool("a", false, "Configure to start automatically on boot")
+	configFile := flag.String("c", "", "Path to custom configuration file")
+	dns := flag.String("dns", "10.64.0.1", "DNS server to use (comma-separated)")
+	preUp := flag.String("preup", "", "Pre-up commands (comma-separated)")
+	postUp := flag.String("postup", "", "Post-up commands (comma-separated)")
+	preDown := flag.String("predown", "", "Pre-down commands (comma-separated)")
+	postDown := flag.String("postdown", "", "Post-down commands (comma-separated)")
 
-	bestServer, latency, err := detect.FindBestServer()
+	flag.Parse()
+
+	var config *config2.Config
+	if *configFile != "" {
+		config, err = config2.LoadCustomConfig(*configFile)
+	} else {
+		config, err = config2.LoadConfig()
+	}
 	if err != nil {
-		log.Fatalf("Error finding best server: %v", err)
+		log.Fatalf("Failed to load config: %v", err)
 	}
 
-	fmt.Printf("Best server: %s (%s) in %s with latency %v\n",
-		bestServer.Hostname, bestServer.IPv4AddrIn, bestServer.CountryName, latency)
+	// Ensure InterfaceName is set
+	if config.InterfaceName == "" {
+		log.Fatalf("InterfaceName must be specified")
+	}
+
+	// Apply customizations to config
+	if *server != "" {
+		config.ServerName = *server
+	}
+	config.EnableMultihop = *multihop
+	config.EnableKillSwitch = *killSwitch
+	config.LocalNetworkCIDR = *localNet
+	config.UseSOCKS5Proxy = *socks5
+	config.DNS = strings.Split(*dns, ",")
+	config.PreUp = strings.Split(*preUp, ",")
+	config.PostUp = strings.Split(*postUp, ",")
+	config.PreDown = strings.Split(*preDown, ",")
+	config.PostDown = strings.Split(*postDown, ",")
+
+	// Get config template
+	configTemplate, err := config2.GetConfigTemplate(config)
+	if err != nil {
+		log.Fatalf("Failed to load config template: %v", err)
+	}
+
+	// Save original DNS config
+	originalDNS, err := network.SaveOriginalDNSConfig()
+	if err != nil {
+		log.Fatalf("Failed to save original DNS config: %v", err)
+	}
+
+	// Configure auto-start if requested
+	if *autoStart {
+		err := vpn.ConfigureAutoStart(config.ServerName)
+		if err != nil {
+			log.Printf("Failed to configure auto-start: %v", err)
+		}
+	}
+
+	// Set default route and DNS
+	err = network.SetDefaultRoute("wg0")
+	if err != nil {
+		log.Fatalf("Failed to set default route: %v", err)
+	}
+
+	err = network.SetDNSConfig(config.DNS)
+	if err != nil {
+		log.Fatalf("Failed to set DNS config: %v", err)
+	}
+
+	// Start VPN connection with multihop and/or SOCKS5 proxy if enabled
+	go vpn.MonitorConnection(configTemplate, config, originalDNS)
+
+	// Keep the main function running
+	select {}
 }
