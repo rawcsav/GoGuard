@@ -25,3 +25,5 @@ config.yaml
 .idea/
 
 GoGuard
+
+.DS_Store

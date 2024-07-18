@@ -20,7 +20,7 @@ func main() {
 	server := flag.String("server", "", "WireGuard server to connect to (e.g., se-mma-wg-001)")
 	country := flag.String("country", "", "Country code for server selection")
 	dns := flag.String("dns", "", "DNS server to use (comma-separated)")
-	latencyBased := flag.Bool("latency", false, "Use latency-based server selection")
+	latencyBased := flag.Bool("latency", true, "Use latency-based server selection")
 
 	flag.Parse()
 
