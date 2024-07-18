@@ -1,0 +1,16 @@
+mullvad_account_number: "your_mullvad_account_number"
+interface_name: "wg0"
+server_name: ""
+country_code: ""
+use_latency_based_selection: true
+dns:
+  - "10.64.0.1"
+pre_up:
+  - "echo 'Pre-up command'"
+post_up:
+  - "echo 'Post-up command'"
+pre_down:
+  - "echo 'Pre-down command'"
+post_down:
+  - "echo 'Post-down command'"
+

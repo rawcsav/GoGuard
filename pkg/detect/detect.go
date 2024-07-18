@@ -17,10 +17,12 @@ type MullvadServer struct {
 	Hostname    string `json:"hostname"`
 	IPv4AddrIn  string `json:"ipv4_addr_in"`
 	CountryName string `json:"country_name"`
+	PublicKey   string `json:"pubkey"`
 	Type        string `json:"type"`
+	Latency     time.Duration
 }
 
-// FetchAllMullvadServers retrieves all Mullvad servers and filters for WireGuard servers.
+// FetchAllMullvadServers fetches the list of all Mullvad servers.
 func FetchAllMullvadServers() ([]MullvadServer, error) {
 	url := "https://api.mullvad.net/www/relays/all/"
 	resp, err := http.Get(url)
@@ -40,7 +42,6 @@ func FetchAllMullvadServers() ([]MullvadServer, error) {
 		return nil, fmt.Errorf("JSON unmarshaling failed: %v", err)
 	}
 
-	// Filter to keep only WireGuard servers
 	var wireguardServers []MullvadServer
 	for _, server := range servers {
 		if strings.ToLower(server.Type) == "wireguard" {
@@ -55,10 +56,16 @@ func FetchAllMullvadServers() ([]MullvadServer, error) {
 	return wireguardServers, nil
 }
 
-// TCPPing performs a TCP ping to measure latency.
+// ServerLatency holds the latency information of a server.
+type ServerLatency struct {
+	Server  MullvadServer
+	Latency time.Duration
+}
+
+// TCPPing pings a server to measure latency.
 func TCPPing(ip string, port int) (time.Duration, error) {
 	start := time.Now()
-	conn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", ip, port), 2*time.Second)
+	conn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", ip, port), 500*time.Millisecond)
 	if err != nil {
 		return 0, err
 	}
@@ -66,29 +73,25 @@ func TCPPing(ip string, port int) (time.Duration, error) {
 	return time.Since(start), nil
 }
 
-// ServerLatency represents a server and its measured latency.
-type ServerLatency struct {
-	Server  MullvadServer
-	Latency time.Duration
-}
-
-// FindBestServer finds the Mullvad WireGuard server with the lowest latency.
-func FindBestServer() (*MullvadServer, time.Duration, error) {
+// FindBestServers finds the best Mullvad servers based on latency.
+func FindBestServers(count int) ([]MullvadServer, error) {
 	servers, err := FetchAllMullvadServers()
 	if err != nil {
-		return nil, 0, err
+		return nil, err
 	}
 
-	results := make(chan ServerLatency)
+	results := make(chan ServerLatency, len(servers))
 	var wg sync.WaitGroup
-	totalServers := len(servers)
-	fmt.Printf("Pinging %d servers\n", totalServers)
+	semaphore := make(chan struct{}, 50)
 
 	for _, server := range servers {
 		wg.Add(1)
 		go func(server MullvadServer) {
 			defer wg.Done()
-			latency, err := TCPPing(server.IPv4AddrIn, 443) // WireGuard typically uses port 51820
+			semaphore <- struct{}{}
+			defer func() { <-semaphore }()
+
+			latency, err := TCPPing(server.IPv4AddrIn, 443)
 			if err != nil {
 				return
 			}
@@ -107,13 +110,130 @@ func FindBestServer() (*MullvadServer, time.Duration, error) {
 		serverLatencies = append(serverLatencies, result)
 	}
 
+	if len(serverLatencies) == 0 {
+		return nil, fmt.Errorf("no servers were successfully pinged")
+	}
+
 	sort.Slice(serverLatencies, func(i, j int) bool {
 		return serverLatencies[i].Latency < serverLatencies[j].Latency
 	})
 
-	if len(serverLatencies) > 0 {
-		bestServer := serverLatencies[0]
-		return &bestServer.Server, bestServer.Latency, nil
+	if count > len(serverLatencies) {
+		count = len(serverLatencies)
 	}
-	return nil, 0, fmt.Errorf("no servers were successfully pinged")
+
+	var bestServers []MullvadServer
+	for i := 0; i < count; i++ {
+		bestServers = append(bestServers, serverLatencies[i].Server)
+	}
+
+	return bestServers, nil
+}
+
+// FindBestServersInCountry finds the best Mullvad servers in a specific country based on latency.
+func FindBestServersInCountry(countryCode string, count int) ([]MullvadServer, error) {
+	servers, err := FetchAllMullvadServers()
+	if err != nil {
+		return nil, err
+	}
+
+	var countryServers []MullvadServer
+	for _, server := range servers {
+		if strings.EqualFold(server.CountryName, countryCode) {
+			countryServers = append(countryServers, server)
+		}
+	}
+
+	if len(countryServers) == 0 {
+		return nil, fmt.Errorf("no servers found in specified country: %s", countryCode)
+	}
+
+	results := make(chan ServerLatency, len(countryServers))
+	var wg sync.WaitGroup
+	semaphore := make(chan struct{}, 50)
+
+	for _, server := range countryServers {
+		wg.Add(1)
+		go func(server MullvadServer) {
+			defer wg.Done()
+			semaphore <- struct{}{}
+			defer func() { <-semaphore }()
+
+			latency, err := TCPPing(server.IPv4AddrIn, 443)
+			if err != nil {
+				return
+			}
+
+			results <- ServerLatency{Server: server, Latency: latency}
+		}(server)
+	}
+
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	var serverLatencies []ServerLatency
+	for result := range results {
+		serverLatencies = append(serverLatencies, result)
+	}
+
+	if len(serverLatencies) == 0 {
+		return nil, fmt.Errorf("no servers were successfully pinged")
+	}
+
+	sort.Slice(serverLatencies, func(i, j int) bool {
+		return serverLatencies[i].Latency < serverLatencies[j].Latency
+	})
+
+	if count > len(serverLatencies) {
+		count = len(serverLatencies)
+	}
+
+	var bestServers []MullvadServer
+	for i := 0; i < count; i++ {
+		bestServers = append(bestServers, serverLatencies[i].Server)
+	}
+
+	return bestServers, nil
+}
+
+// SelectBestServer selects the best Mullvad server based on the given configuration.
+func SelectBestServer(serverName, countryCode string, useLatencyBasedSelection bool) (*MullvadServer, error) {
+	var bestServers []MullvadServer
+	var err error
+
+	switch {
+	case serverName != "":
+		bestServers, err = FetchAllMullvadServers()
+		if err != nil {
+			return nil, fmt.Errorf("failed to fetch Mullvad servers: %v", err)
+		}
+		for _, server := range bestServers {
+			if server.Hostname == serverName {
+				return &server, nil
+			}
+		}
+		return nil, fmt.Errorf("specified server %s not found", serverName)
+
+	case countryCode != "":
+		bestServers, err = FindBestServersInCountry(countryCode, 1)
+		if err != nil {
+			return nil, fmt.Errorf("failed to find best server in country: %v", err)
+		}
+		if len(bestServers) > 0 {
+			return &bestServers[0], nil
+		}
+
+	case useLatencyBasedSelection:
+		bestServers, err = FindBestServers(1)
+		if err != nil {
+			return nil, fmt.Errorf("failed to find best server: %v", err)
+		}
+		if len(bestServers) > 0 {
+			return &bestServers[0], nil
+		}
+	}
+
+	return nil, fmt.Errorf("no server selected")
 }

@@ -7,7 +7,9 @@
 *.dll
 *.so
 *.dylib
-
+/etc
+/etc/*
+.env
 # Test binary, built with `go test -c`
 *.test
 
@@ -19,7 +21,7 @@
 
 # Go workspace file
 go.work
-
+config.yaml
 .idea/
 
 GoGuard
