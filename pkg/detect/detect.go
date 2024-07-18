@@ -197,3 +197,43 @@ func FindBestServersInCountry(countryCode string, count int) ([]MullvadServer, e
 
 	return bestServers, nil
 }
+
+// SelectBestServer selects the best Mullvad server based on the given configuration.
+func SelectBestServer(serverName, countryCode string, useLatencyBasedSelection bool) (*MullvadServer, error) {
+	var bestServers []MullvadServer
+	var err error
+
+	switch {
+	case serverName != "":
+		bestServers, err = FetchAllMullvadServers()
+		if err != nil {
+			return nil, fmt.Errorf("failed to fetch Mullvad servers: %v", err)
+		}
+		for _, server := range bestServers {
+			if server.Hostname == serverName {
+				return &server, nil
+			}
+		}
+		return nil, fmt.Errorf("specified server %s not found", serverName)
+
+	case countryCode != "":
+		bestServers, err = FindBestServersInCountry(countryCode, 1)
+		if err != nil {
+			return nil, fmt.Errorf("failed to find best server in country: %v", err)
+		}
+		if len(bestServers) > 0 {
+			return &bestServers[0], nil
+		}
+
+	case useLatencyBasedSelection:
+		bestServers, err = FindBestServers(1)
+		if err != nil {
+			return nil, fmt.Errorf("failed to find best server: %v", err)
+		}
+		if len(bestServers) > 0 {
+			return &bestServers[0], nil
+		}
+	}
+
+	return nil, fmt.Errorf("no server selected")
+}

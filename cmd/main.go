@@ -1,101 +1,108 @@
 package main
 
 import (
-	config2 "GoGuard/pkg/config"
+	"flag"
+	"fmt"
+	"log"
+	"os"
+	"os/signal"
+	"strings"
+	"syscall"
+
+	"GoGuard/pkg/config"
+	"GoGuard/pkg/detect"
 	"GoGuard/pkg/network"
 	"GoGuard/pkg/vpn"
-	"flag"
-	"github.com/joho/godotenv"
-	"log"
-	"path/filepath"
-	"strings"
 )
 
 func main() {
-	// Load environment variables from .env file
-	err := godotenv.Load(filepath.Join("../", ".env"))
-	if err != nil {
-		log.Println("No .env file found")
-	}
-
-	multihop := flag.Bool("m", false, "Enable multihop (2 hops)")
-	server := flag.String("s", "", "WireGuard server to connect to (e.g., se-mma-wg-001)")
-	killSwitch := flag.Bool("k", false, "Enable kill switch")
-	localNet := flag.String("l", "", "Local network CIDR for sharing (e.g., 192.168.1.0/24)")
-	socks5 := flag.Bool("p", false, "Use SOCKS5 proxy for additional hop")
-	autoStart := flag.Bool("a", false, "Configure to start automatically on boot")
-	configFile := flag.String("c", "", "Path to custom configuration file")
-	dns := flag.String("dns", "10.64.0.1", "DNS server to use (comma-separated)")
-	preUp := flag.String("preup", "", "Pre-up commands (comma-separated)")
-	postUp := flag.String("postup", "", "Post-up commands (comma-separated)")
-	preDown := flag.String("predown", "", "Pre-down commands (comma-separated)")
-	postDown := flag.String("postdown", "", "Post-down commands (comma-separated)")
+	configFile := flag.String("config", "config.yaml", "Path to configuration file")
+	server := flag.String("server", "", "WireGuard server to connect to (e.g., se-mma-wg-001)")
+	country := flag.String("country", "", "Country code for server selection")
+	dns := flag.String("dns", "", "DNS server to use (comma-separated)")
+	latencyBased := flag.Bool("latency", false, "Use latency-based server selection")
 
 	flag.Parse()
 
-	var config *config2.Config
-	if *configFile != "" {
-		config, err = config2.LoadCustomConfig(*configFile)
-	} else {
-		config, err = config2.LoadConfig()
-	}
+	// Load configuration
+	cfg, err := config.LoadConfig(*configFile)
 	if err != nil {
 		log.Fatalf("Failed to load config: %v", err)
 	}
 
-	// Ensure InterfaceName is set
-	if config.InterfaceName == "" {
-		log.Fatalf("InterfaceName must be specified")
-	}
-
-	// Apply customizations to config
 	if *server != "" {
-		config.ServerName = *server
+		cfg.ServerName = *server
 	}
-	config.EnableMultihop = *multihop
-	config.EnableKillSwitch = *killSwitch
-	config.LocalNetworkCIDR = *localNet
-	config.UseSOCKS5Proxy = *socks5
-	config.DNS = strings.Split(*dns, ",")
-	config.PreUp = strings.Split(*preUp, ",")
-	config.PostUp = strings.Split(*postUp, ",")
-	config.PreDown = strings.Split(*preDown, ",")
-	config.PostDown = strings.Split(*postDown, ",")
+	if *country != "" {
+		cfg.CountryCode = *country
+	}
 
-	// Get config template
-	configTemplate, err := config2.GetConfigTemplate(config)
-	if err != nil {
-		log.Fatalf("Failed to load config template: %v", err)
+	if *dns != "" {
+		cfg.DNS = strings.Split(*dns, ",")
 	}
+	if *latencyBased {
+		cfg.UseLatencyBasedSelection = true
+	}
+
+	// Select the best server based on the configuration
+	selectedServer, err := detect.SelectBestServer(cfg.ServerName, cfg.CountryCode, cfg.UseLatencyBasedSelection)
+	if err != nil {
+		log.Fatalf("Failed to select server: %v", err)
+	}
+
+	fmt.Printf("Selected server: %s (%s, %s)\n", selectedServer.Hostname, selectedServer.CountryName, selectedServer.IPv4AddrIn)
+
+	// Update cfg with the selected server information
+	cfg.ServerName = selectedServer.Hostname
+
+	fmt.Printf("Configuration:\n%+v\n", cfg)
 
 	// Save original DNS config
 	originalDNS, err := network.SaveOriginalDNSConfig()
 	if err != nil {
+		cleanup(cfg.InterfaceName, originalDNS)
 		log.Fatalf("Failed to save original DNS config: %v", err)
 	}
 
-	// Configure auto-start if requested
-	if *autoStart {
-		err := vpn.ConfigureAutoStart(config.ServerName)
-		if err != nil {
-			log.Printf("Failed to configure auto-start: %v", err)
-		}
-	}
-
-	// Set default route and DNS
-	err = network.SetDefaultRoute("wg0")
+	// Setup VPN
+	err = vpn.SetupVPN(cfg, selectedServer)
 	if err != nil {
-		log.Fatalf("Failed to set default route: %v", err)
+		cleanup(cfg.InterfaceName, originalDNS)
+		log.Fatalf("Failed to setup VPN: %v", err)
 	}
 
-	err = network.SetDNSConfig(config.DNS)
+	// Setup routing and DNS for the interface
+	err = network.SetupRoutingAndDNS(cfg.InterfaceName, cfg.DNS)
 	if err != nil {
-		log.Fatalf("Failed to set DNS config: %v", err)
+		cleanup(cfg.InterfaceName, originalDNS)
+		log.Fatalf("Failed to setup routing and DNS: %v", err)
 	}
 
-	// Start VPN connection with multihop and/or SOCKS5 proxy if enabled
-	go vpn.MonitorConnection(configTemplate, config, originalDNS)
+	// Start VPN connection monitoring
+	go vpn.MonitorConnection(cfg, originalDNS)
 
-	// Keep the main function running
-	select {}
+	// Setup signal handling for graceful shutdown
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+
+	// Wait for termination signal
+	<-sigChan
+
+	// Cleanup and disconnect
+	log.Println("Received termination signal. Cleaning up...")
+	cleanup(cfg.InterfaceName, originalDNS)
+	log.Println("Cleanup complete. Exiting.")
+}
+
+// cleanup reverts the DNS configuration and disconnects the VPN
+func cleanup(interfaceName, originalDNS string) {
+	if err := vpn.DisconnectVPN(interfaceName); err != nil {
+		log.Printf("Failed to disconnect VPN: %v", err)
+	}
+	if err := network.RevertDefaultRoute(); err != nil {
+		log.Printf("Failed to revert default route: %v", err)
+	}
+	if err := network.RevertDNSConfig(originalDNS); err != nil {
+		log.Printf("Failed to revert DNS config: %v", err)
+	}
 }

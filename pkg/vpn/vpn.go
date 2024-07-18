@@ -4,28 +4,113 @@ import (
 	"GoGuard/pkg/config"
 	"GoGuard/pkg/detect"
 	"GoGuard/pkg/network"
-	"bytes"
 	"encoding/json"
 	"fmt"
 	"github.com/biter777/countries"
 	"io/ioutil"
 	"log"
 	"net/http"
+	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
 	"strings"
 	"time"
 )
 
-// Mullvad API endpoint for user status
 const mullvadStatusAPI = "https://am.i.mullvad.net/json"
 
-func getWireguardConfigPath(interfaceName string) string {
-	return filepath.Join("/etc/wireguard", fmt.Sprintf("%s.conf", interfaceName))
+func SetupVPN(cfg *config.Config, server *detect.MullvadServer) error {
+	wireGuardConfig, err := config.GenerateWireGuardConfig(cfg, server)
+	if err != nil {
+		return fmt.Errorf("failed to generate WireGuard config: %v", err)
+	}
+
+	configPath := config.GetWireGuardConfigPath(cfg.InterfaceName)
+
+	// Ensure the directory exists
+	configDir := filepath.Dir(configPath)
+	err = os.MkdirAll(configDir, 0700)
+	if err != nil {
+		return fmt.Errorf("failed to create directory %s: %v", configDir, err)
+	}
+
+	err = os.WriteFile(configPath, []byte(wireGuardConfig), 0600)
+	if err != nil {
+		return fmt.Errorf("failed to write WireGuard config: %v", err)
+	}
+
+	cmd := exec.Command("sudo", "wg-quick", "up", cfg.InterfaceName)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("failed to bring up WireGuard interface: %v\nOutput: %s", err, string(output))
+	}
+
+	return nil
 }
 
-// VPNStatus checks the current VPN status using Mullvad's API
+func MonitorConnection(cfg *config.Config, originalDNS string) {
+	defer func() {
+		if err := network.RevertDefaultRoute(); err != nil {
+			log.Printf("Failed to revert default route: %v", err)
+		}
+
+		if err := network.RevertDNSConfig(originalDNS); err != nil {
+			log.Printf("Failed to revert DNS config: %v", err)
+		}
+	}()
+
+	for {
+		secure, _, _, _, _, _, _, err := VPNStatus()
+		if err != nil || !secure {
+			log.Println("Connection is not secure or error occurred, switching servers...")
+
+			// Re-select the best server
+			selectedServer, err := detect.SelectBestServer(cfg.ServerName, cfg.CountryCode, cfg.UseLatencyBasedSelection)
+			if err != nil {
+				log.Printf("Failed to select server: %v", err)
+				continue
+			}
+
+			if err := SwitchServer(cfg, selectedServer); err != nil {
+				log.Printf("Failed to switch servers: %v", err)
+				// If switching server fails, stop the connection
+				if disconnectErr := DisconnectVPN(cfg.InterfaceName); disconnectErr != nil {
+					log.Printf("Failed to disconnect VPN after switch failure: %v", disconnectErr)
+				}
+				break
+			}
+		}
+		time.Sleep(5 * time.Minute)
+	}
+}
+
+func SwitchServer(cfg *config.Config, server *detect.MullvadServer) error {
+	err := DisconnectVPN(cfg.InterfaceName)
+	if err != nil {
+		return fmt.Errorf("failed to disconnect VPN: %v", err)
+	}
+
+	err = SetupVPN(cfg, server)
+	if err != nil {
+		// If setting up the VPN fails, stop the connection
+		if disconnectErr := DisconnectVPN(cfg.InterfaceName); disconnectErr != nil {
+			log.Printf("Failed to disconnect VPN after setup failure: %v", disconnectErr)
+		}
+		return fmt.Errorf("failed to setup VPN: %v", err)
+	}
+
+	return nil
+}
+
+func DisconnectVPN(interfaceName string) error {
+	cmd := exec.Command("sudo", "wg-quick", "down", interfaceName)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("failed to disconnect VPN: %v\nOutput: %s", err, string(output))
+	}
+	return nil
+}
+
 func VPNStatus() (bool, string, string, string, bool, string, bool, error) {
 	resp, err := http.Get(mullvadStatusAPI)
 	if err != nil {
@@ -54,203 +139,20 @@ func VPNStatus() (bool, string, string, string, bool, string, bool, error) {
 	return secure, ip, countryCode, city, mullvadServer, organization, blacklisted, nil
 }
 
-// validateCountry checks if the input is a valid country code or converts the country name to a country code
 func validateCountry(country string) string {
-	re := regexp.MustCompile("^[A-Z]{2}$")
-	if re.MatchString(country) {
-		return country
-	}
-	return countries.ByName(country).Alpha2()
-}
-
-// switchServer switches to the best available Mullvad WireGuard servers based on user preferences
-func switchServer(configTemplate string, cfg *config.Config) error {
-	var bestServers []detect.MullvadServer
-	var err error
-
-	if cfg.ServerName != "" {
-		// User specified a server, use it
-		bestServers = []detect.MullvadServer{{Hostname: cfg.ServerName}}
-	} else if cfg.CountryCode != "" {
-		bestServers, err = detect.FindBestServersInCountry(cfg.CountryCode, 1)
-		if cfg.EnableMultihop {
-			var secondHop []detect.MullvadServer
-			secondHop, err = detect.FindBestServersInCountry(cfg.CountryCode, 1)
-			bestServers = append(bestServers, secondHop...)
-		}
-	} else {
-		// Use latency-based selection
-		bestServers, err = detect.FindBestServers(1)
-		if cfg.EnableMultihop {
-			var secondHop []detect.MullvadServer
-			secondHop, err = detect.FindBestServers(1)
-			bestServers = append(bestServers, secondHop...)
+	// If it's already a 2-letter country code, validate and return it
+	if len(country) == 2 {
+		if countries.ByName(country).IsValid() {
+			return strings.ToUpper(country)
 		}
 	}
 
-	if err != nil {
-		return fmt.Errorf("error finding best servers: %v", err)
+	// If it's a country name, try to get its code
+	countryCode := countries.ByName(country)
+	if countryCode.IsValid() {
+		return countryCode.Alpha2()
 	}
 
-	peerConfig := ""
-	for _, server := range bestServers {
-		peerConfig += fmt.Sprintf("[Peer]\nPublicKey = %s\nEndpoint = %s:51820\nAllowedIPs = 0.0.0.0/0, ::/0\n\n",
-			server.PublicKey, server.IPv4AddrIn)
-	}
-
-	newConfig := strings.Replace(configTemplate, "[PEER_CONFIG]", peerConfig, 1)
-
-	// Apply custom configuration options
-	newConfig = cfg.ModifyWireguardConfig(newConfig)
-
-	log.Printf("Generated WireGuard config: %s", newConfig)
-
-	configPath := getWireguardConfigPath(cfg.InterfaceName)
-	err = ioutil.WriteFile(configPath, []byte(newConfig), 0600)
-	if err != nil {
-		return fmt.Errorf("failed to write WireGuard config: %v", err)
-	}
-
-	// Check if WireGuard interface is up before bringing it down
-	cmd := exec.Command("sudo", "wg", "show", "wg0")
-	if err := cmd.Run(); err == nil {
-		err = exec.Command("sudo", "wg-quick", "down", "wg0").Run()
-		if err != nil {
-			return fmt.Errorf("failed to bring down WireGuard interface: %v", err)
-		}
-	}
-
-	err = exec.Command("sudo", "wg-quick", "up", "wg0").Run()
-	if err != nil {
-		return fmt.Errorf("failed to bring up WireGuard interface: %v", err)
-	}
-
-	return nil
-}
-
-// MonitorConnection continuously monitors the VPN connection and switches servers if needed
-func MonitorConnection(configTemplate string, cfg *config.Config, originalDNS string) {
-	defer func() {
-		// Revert network settings on exit
-		if err := network.RevertDefaultRoute(); err != nil {
-			log.Printf("Failed to revert default route: %v", err)
-		}
-
-		if err := network.RevertDNSConfig(originalDNS); err != nil {
-			log.Printf("Failed to revert DNS config: %v", err)
-		}
-	}()
-
-	for {
-		secure, _, _, _, _, _, _, err := VPNStatus()
-		if err != nil || !secure {
-			log.Println("Connection is not secure or error occurred, switching servers...")
-			if err := switchServer(configTemplate, cfg); err != nil {
-				log.Printf("Failed to switch servers: %v", err)
-			}
-		}
-		time.Sleep(5 * time.Minute) // Check every 5 minutes
-	}
-}
-
-// ConfigureAutoStart sets up WireGuard to start automatically on boot
-func ConfigureAutoStart(serverName string) error {
-	cmd := exec.Command("sudo", "systemctl", "enable", fmt.Sprintf("wg-quick@%s", serverName))
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("failed to configure auto-start: %v\nOutput: %s", err, string(output))
-	}
-	return nil
-}
-
-// DisconnectVPN brings down the WireGuard interface
-func DisconnectVPN() error {
-	cmd := exec.Command("sudo", "wg-quick", "down", "wg0")
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("failed to disconnect VPN: %v\nOutput: %s", err, string(output))
-	}
-	return nil
-}
-
-// ConnectVPN brings up the WireGuard interface
-func ConnectVPN() error {
-	cmd := exec.Command("sudo", "wg-quick", "up", "wg0")
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("failed to connect VPN: %v\nOutput: %s", err, string(output))
-	}
-	return nil
-}
-
-// UpdateWireguardKeys rotates the WireGuard keys
-func UpdateWireguardKeys(cfg *config.Config) error {
-	// Generate new keys
-	privateKey, err := exec.Command("wg", "genkey").Output()
-	if err != nil {
-		return fmt.Errorf("failed to generate private key: %v", err)
-	}
-
-	pubCmd := exec.Command("wg", "pubkey")
-	pubCmd.Stdin = strings.NewReader(string(privateKey))
-	publicKey, err := pubCmd.Output()
-	if err != nil {
-		return fmt.Errorf("failed to generate public key: %v", err)
-	}
-
-	configPath := getWireguardConfigPath(cfg.InterfaceName)
-	configContent, err := ioutil.ReadFile(configPath)
-	if err != nil {
-		return fmt.Errorf("failed to read WireGuard config: %v", err)
-	}
-
-	newContent := regexp.MustCompile(`(?m)^PrivateKey = .*`).ReplaceAllString(
-		string(configContent),
-		fmt.Sprintf("PrivateKey = %s", strings.TrimSpace(string(privateKey))),
-	)
-
-	err = ioutil.WriteFile(configPath, []byte(newContent), 0600)
-	if err != nil {
-		return fmt.Errorf("failed to write updated WireGuard config: %v", err)
-	}
-
-	// Send the new public key to Mullvad's API
-	if err := updateMullvadPublicKey(cfg.MullvadAccountNumber, strings.TrimSpace(string(publicKey))); err != nil {
-		return fmt.Errorf("failed to update Mullvad public key: %v", err)
-	}
-
-	return nil
-}
-
-// updateMullvadPublicKey sends the new public key to Mullvad's API
-func updateMullvadPublicKey(accountNumber, publicKey string) error {
-	url := fmt.Sprintf("https://api.mullvad.net/v1/account/%s/wireguard-key/", accountNumber)
-	data := map[string]string{
-		"key": publicKey,
-	}
-
-	jsonData, err := json.Marshal(data)
-	if err != nil {
-		return fmt.Errorf("failed to marshal JSON data: %v", err)
-	}
-
-	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
-	if err != nil {
-		return fmt.Errorf("failed to create request: %v", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	client := &http.Client{}
-	resp, err := client.Do(req)
-	if err != nil {
-		return fmt.Errorf("failed to send request: %v", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := ioutil.ReadAll(resp.Body)
-		return fmt.Errorf("failed to update public key, status code: %d, response: %s", resp.StatusCode, string(body))
-	}
-
-	return nil
+	// If we couldn't validate the country, return an empty string
+	return ""
 }
