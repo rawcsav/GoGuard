@@ -1,7 +1,7 @@
 package config
 
 import (
-	"GoGuard/pkg/detect"
+	"GoGuard/internal/detect"
 	"fmt"
 	"github.com/spf13/viper"
 	"io/ioutil"

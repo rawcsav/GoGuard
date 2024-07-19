@@ -1,9 +1,9 @@
 package vpn
 
 import (
-	"GoGuard/pkg/config"
-	"GoGuard/pkg/detect"
-	"GoGuard/pkg/network"
+	"GoGuard/internal/config"
+	"GoGuard/internal/detect"
+	"GoGuard/internal/network"
 	"encoding/json"
 	"fmt"
 	"github.com/biter777/countries"
