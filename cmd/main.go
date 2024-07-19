@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"log"
@@ -9,92 +10,111 @@ import (
 	"strings"
 	"syscall"
 
-	"GoGuard/pkg/config"
-	"GoGuard/pkg/detect"
-	"GoGuard/pkg/network"
-	"GoGuard/pkg/vpn"
+	"GoGuard/internal/config"
+	"GoGuard/internal/detect"
+	"GoGuard/internal/network"
+	"GoGuard/internal/vpn"
+	"go.uber.org/fx"
+	"go.uber.org/zap"
 )
 
-func main() {
+// newLogger provides a new zap.Logger instance.
+func newLogger() (*zap.Logger, error) {
+	return zap.NewProduction()
+}
+
+// loadConfig loads the configuration from the specified file.
+func loadConfig(configFile string) (*config.Config, error) {
+	return config.LoadConfig(configFile)
+}
+
+// ConfigFlags holds the command-line flags.
+type ConfigFlags struct {
+	ConfigFile   string
+	Server       string
+	Country      string
+	DNS          string
+	LatencyBased bool
+}
+
+// provideConfigFlags parses and provides the command-line flags.
+func provideConfigFlags() ConfigFlags {
 	configFile := flag.String("config", "config.yaml", "Path to configuration file")
 	server := flag.String("server", "", "WireGuard server to connect to (e.g., se-mma-wg-001)")
 	country := flag.String("country", "", "Country code for server selection")
 	dns := flag.String("dns", "", "DNS server to use (comma-separated)")
 	latencyBased := flag.Bool("latency", true, "Use latency-based server selection")
-
 	flag.Parse()
 
-	// Load configuration
-	cfg, err := config.LoadConfig(*configFile)
-	if err != nil {
-		log.Fatalf("Failed to load config: %v", err)
+	return ConfigFlags{
+		ConfigFile:   *configFile,
+		Server:       *server,
+		Country:      *country,
+		DNS:          *dns,
+		LatencyBased: *latencyBased,
 	}
-
-	if *server != "" {
-		cfg.ServerName = *server
-	}
-	if *country != "" {
-		cfg.CountryCode = *country
-	}
-
-	if *dns != "" {
-		cfg.DNS = strings.Split(*dns, ",")
-	}
-	if *latencyBased {
-		cfg.UseLatencyBasedSelection = true
-	}
-
-	// Select the best server based on the configuration
-	selectedServer, err := detect.SelectBestServer(cfg.ServerName, cfg.CountryCode, cfg.UseLatencyBasedSelection)
-	if err != nil {
-		log.Fatalf("Failed to select server: %v", err)
-	}
-
-	fmt.Printf("Selected server: %s (%s, %s)\n", selectedServer.Hostname, selectedServer.CountryName, selectedServer.IPv4AddrIn)
-
-	// Update cfg with the selected server information
-	cfg.ServerName = selectedServer.Hostname
-
-	fmt.Printf("Configuration:\n%+v\n", cfg)
-
-	// Save original DNS config
-	originalDNS, err := network.SaveOriginalDNSConfig()
-	if err != nil {
-		cleanup(cfg.InterfaceName, originalDNS)
-		log.Fatalf("Failed to save original DNS config: %v", err)
-	}
-
-	// Setup VPN
-	err = vpn.SetupVPN(cfg, selectedServer)
-	if err != nil {
-		cleanup(cfg.InterfaceName, originalDNS)
-		log.Fatalf("Failed to setup VPN: %v", err)
-	}
-
-	// Setup routing and DNS for the interface
-	err = network.SetupRoutingAndDNS(cfg.InterfaceName, cfg.DNS)
-	if err != nil {
-		cleanup(cfg.InterfaceName, originalDNS)
-		log.Fatalf("Failed to setup routing and DNS: %v", err)
-	}
-
-	// Start VPN connection monitoring
-	go vpn.MonitorConnection(cfg, originalDNS)
-
-	// Setup signal handling for graceful shutdown
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-
-	// Wait for termination signal
-	<-sigChan
-
-	// Cleanup and disconnect
-	log.Println("Received termination signal. Cleaning up...")
-	cleanup(cfg.InterfaceName, originalDNS)
-	log.Println("Cleanup complete. Exiting.")
 }
 
-// cleanup reverts the DNS configuration and disconnects the VPN
+// selectBestServer selects the best server based on the configuration.
+func selectBestServer(cfg *config.Config) (*detect.MullvadServer, error) {
+	return detect.SelectBestServer(cfg.ServerName, cfg.CountryCode, cfg.UseLatencyBasedSelection)
+}
+
+func run(lc fx.Lifecycle, logger *zap.Logger, cfg *config.Config, selectedServer *detect.MullvadServer, flags ConfigFlags) {
+	lc.Append(fx.Hook{
+		OnStart: func(ctx context.Context) error {
+			if flags.Server != "" {
+				cfg.ServerName = flags.Server
+			}
+			if flags.Country != "" {
+				cfg.CountryCode = flags.Country
+			}
+			if flags.DNS != "" {
+				cfg.DNS = strings.Split(flags.DNS, ",")
+			}
+			cfg.UseLatencyBasedSelection = flags.LatencyBased
+
+			fmt.Printf("Selected server: %s (%s, %s)\n", selectedServer.Hostname, selectedServer.CountryName, selectedServer.IPv4AddrIn)
+			cfg.ServerName = selectedServer.Hostname
+			fmt.Printf("Configuration:\n%+v\n", cfg)
+
+			originalDNS, err := network.SaveOriginalDNSConfig()
+			if err != nil {
+				cleanup(cfg.InterfaceName, originalDNS)
+				return fmt.Errorf("failed to save original DNS config: %v", err)
+			}
+
+			err = vpn.SetupVPN(cfg, selectedServer)
+			if err != nil {
+				cleanup(cfg.InterfaceName, originalDNS)
+				return fmt.Errorf("failed to setup VPN: %v", err)
+			}
+
+			err = network.SetupRoutingAndDNS(cfg.InterfaceName, cfg.DNS)
+			if err != nil {
+				cleanup(cfg.InterfaceName, originalDNS)
+				return fmt.Errorf("failed to setup routing and DNS: %v", err)
+			}
+
+			go vpn.MonitorConnection(cfg, originalDNS)
+
+			sigChan := make(chan os.Signal, 1)
+			signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+
+			go func() {
+				<-sigChan
+				logger.Info("Received termination signal. Cleaning up...")
+				cleanup(cfg.InterfaceName, originalDNS)
+				logger.Info("Cleanup complete. Exiting.")
+				os.Exit(0)
+			}()
+
+			return nil
+		},
+	})
+}
+
+// cleanup reverts the DNS configuration and disconnects the VPN.
 func cleanup(interfaceName, originalDNS string) {
 	if err := vpn.DisconnectVPN(interfaceName); err != nil {
 		log.Printf("Failed to disconnect VPN: %v", err)
@@ -105,4 +125,19 @@ func cleanup(interfaceName, originalDNS string) {
 	if err := network.RevertDNSConfig(originalDNS); err != nil {
 		log.Printf("Failed to revert DNS config: %v", err)
 	}
+}
+
+func main() {
+	app := fx.New(
+		fx.Provide(
+			newLogger,
+			provideConfigFlags,
+			func(flags ConfigFlags) string { return flags.ConfigFile },
+			loadConfig,
+			selectBestServer,
+		),
+		fx.Invoke(run),
+	)
+
+	app.Run()
 }
