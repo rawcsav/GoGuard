@@ -7,8 +7,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"github.com/biter777/countries"
+	"go.uber.org/zap"
 	"io/ioutil"
-	"log"
 	"net/http"
 	"os"
 	"os/exec"
@@ -19,6 +19,17 @@ import (
 
 const mullvadStatusAPI = "https://am.i.mullvad.net/json"
 
+type VPNManager struct {
+	Config *config.Config
+	Logger *zap.Logger
+}
+
+func NewVPNManager(config *config.Config, logger *zap.Logger) *VPNManager {
+	return &VPNManager{
+		Config: config,
+		Logger: logger,
+	}
+}
 func SetupVPN(cfg *config.Config, server *detect.MullvadServer) error {
 	wireGuardConfig, err := config.GenerateWireGuardConfig(cfg, server)
 	if err != nil {
@@ -47,35 +58,32 @@ func SetupVPN(cfg *config.Config, server *detect.MullvadServer) error {
 
 	return nil
 }
-
-func MonitorConnection(cfg *config.Config, originalDNS string) {
+func (vm *VPNManager) MonitorConnection(originalDNS string) {
 	defer func() {
 		if err := network.RevertDefaultRoute(); err != nil {
-			log.Printf("Failed to revert default route: %v", err)
+			vm.Logger.Error("Failed to revert default route", zap.Error(err))
 		}
 
 		if err := network.RevertDNSConfig(originalDNS); err != nil {
-			log.Printf("Failed to revert DNS config: %v", err)
+			vm.Logger.Error("Failed to revert DNS config", zap.Error(err))
 		}
 	}()
 
 	for {
 		secure, _, _, _, _, _, _, err := VPNStatus()
 		if err != nil || !secure {
-			log.Println("Connection is not secure or error occurred, switching servers...")
+			vm.Logger.Info("Connection is not secure or error occurred, switching servers...")
 
-			// Re-select the best server
-			selectedServer, err := detect.SelectBestServer(cfg.ServerName, cfg.CountryCode, cfg.UseLatencyBasedSelection)
+			selectedServer, err := detect.SelectBestServer(vm.Config.ServerName, vm.Config.CountryCode, vm.Config.UseLatencyBasedSelection)
 			if err != nil {
-				log.Printf("Failed to select server: %v", err)
+				vm.Logger.Error("Failed to select server", zap.Error(err))
 				continue
 			}
 
-			if err := SwitchServer(cfg, selectedServer); err != nil {
-				log.Printf("Failed to switch servers: %v", err)
-				// If switching server fails, stop the connection
-				if disconnectErr := DisconnectVPN(cfg.InterfaceName); disconnectErr != nil {
-					log.Printf("Failed to disconnect VPN after switch failure: %v", disconnectErr)
+			if err := vm.SwitchServer(selectedServer); err != nil {
+				vm.Logger.Error("Failed to switch servers", zap.Error(err))
+				if disconnectErr := DisconnectVPN(vm.Config.InterfaceName); disconnectErr != nil {
+					vm.Logger.Error("Failed to disconnect VPN after switch failure", zap.Error(disconnectErr))
 				}
 				break
 			}
@@ -84,17 +92,16 @@ func MonitorConnection(cfg *config.Config, originalDNS string) {
 	}
 }
 
-func SwitchServer(cfg *config.Config, server *detect.MullvadServer) error {
-	err := DisconnectVPN(cfg.InterfaceName)
+func (vm *VPNManager) SwitchServer(server *detect.MullvadServer) error {
+	err := DisconnectVPN(vm.Config.InterfaceName)
 	if err != nil {
 		return fmt.Errorf("failed to disconnect VPN: %v", err)
 	}
 
-	err = SetupVPN(cfg, server)
+	err = SetupVPN(vm.Config, server)
 	if err != nil {
-		// If setting up the VPN fails, stop the connection
-		if disconnectErr := DisconnectVPN(cfg.InterfaceName); disconnectErr != nil {
-			log.Printf("Failed to disconnect VPN after setup failure: %v", disconnectErr)
+		if disconnectErr := DisconnectVPN(vm.Config.InterfaceName); disconnectErr != nil {
+			vm.Logger.Error("Failed to disconnect VPN after setup failure", zap.Error(disconnectErr))
 		}
 		return fmt.Errorf("failed to setup VPN: %v", err)
 	}
