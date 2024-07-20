@@ -35,19 +35,14 @@ type MullvadServer struct {
 
 func LoadConfig(configFile string) (*Config, error) {
 	v := viper.New()
-
-	// Set default values
-	v.SetDefault("interface_name", "wg0")
-	v.SetDefault("dns", []string{"10.64.0.1"})
+	setDefaults(v)
 	v.AutomaticEnv()
 	v.SetEnvPrefix("GOGUARD")
 	v.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
 
-	// Read from config file if specified
 	if configFile != "" {
-		v.SetConfigFile(configFile)
-		if err := v.ReadInConfig(); err != nil {
-			return nil, fmt.Errorf("error reading config file: %w", err)
+		if err := readConfigFile(v, configFile); err != nil {
+			return nil, err
 		}
 	}
 
@@ -56,45 +51,68 @@ func LoadConfig(configFile string) (*Config, error) {
 		return nil, fmt.Errorf("unable to decode into struct: %w", err)
 	}
 
-	// Validate required fields
-	if config.MullvadAccountNumber == "" {
-		return nil, fmt.Errorf("Mullvad account number is required")
+	if err := validateConfig(&config); err != nil {
+		return nil, err
 	}
 
 	return &config, nil
 }
 
+func setDefaults(v *viper.Viper) {
+	v.SetDefault("interface_name", "wg0")
+	v.SetDefault("dns", []string{"10.64.0.1"})
+}
+
+func readConfigFile(v *viper.Viper, configFile string) error {
+	v.SetConfigFile(configFile)
+	if err := v.ReadInConfig(); err != nil {
+		return fmt.Errorf("error reading config file: %w", err)
+	}
+	return nil
+}
+
+func validateConfig(config *Config) error {
+	if config.MullvadAccountNumber == "" {
+		return fmt.Errorf("Mullvad account number is required")
+	}
+	return nil
+}
+
 func getOrGenerateKeys(interfaceName string) (privateKey, publicKey string, err error) {
 	configPath := GetWireGuardConfigPath(interfaceName)
 	if _, err := os.Stat(configPath); err == nil {
-		// Configuration file exists, extract keys
-		existingConfig, err := ioutil.ReadFile(configPath)
+		privateKey, err = extractPrivateKey(configPath)
 		if err != nil {
-			return "", "", fmt.Errorf("failed to read existing WireGuard config: %v", err)
-		}
-
-		privateKey = extractKey(string(existingConfig), "PrivateKey")
-		if privateKey == "" {
-			privateKey, err = generatePrivateKey()
-			if err != nil {
-				return "", "", fmt.Errorf("failed to generate private key: %v", err)
-			}
+			return "", "", err
 		}
 	} else {
-		// Configuration file does not exist, generate new private key
 		privateKey, err = generatePrivateKey()
 		if err != nil {
-			return "", "", fmt.Errorf("failed to generate private key: %v", err)
+			return "", "", err
 		}
 	}
 
-	// Always generate the public key from the private key
 	publicKey, err = generatePublicKey(privateKey)
 	if err != nil {
-		return "", "", fmt.Errorf("failed to generate public key: %v", err)
+		return "", "", err
 	}
 
 	return privateKey, publicKey, nil
+}
+
+func extractPrivateKey(configPath string) (string, error) {
+	existingConfig, err := ioutil.ReadFile(configPath)
+	if err != nil {
+		return "", fmt.Errorf("failed to read existing WireGuard config: %v", err)
+	}
+	privateKey := extractKey(string(existingConfig), "PrivateKey")
+	if privateKey == "" {
+		privateKey, err = generatePrivateKey()
+		if err != nil {
+			return "", fmt.Errorf("failed to generate private key: %v", err)
+		}
+	}
+	return privateKey, nil
 }
 
 func validateKeys(privateKey, publicKey string) error {
@@ -116,7 +134,12 @@ func GenerateWireGuardConfig(cfg *Config, server *detect.MullvadServer) (string,
 		return "", fmt.Errorf("failed to get client IP: %v", err)
 	}
 
-	config := fmt.Sprintf(`[Interface]
+	config := buildWireGuardConfig(cfg, server, privateKey, clientIP)
+	return ModifyWireGuardConfig(cfg, config), nil
+}
+
+func buildWireGuardConfig(cfg *Config, server *detect.MullvadServer, privateKey, clientIP string) string {
+	return fmt.Sprintf(`[Interface]
 PrivateKey = %s
 Address = %s/32
 DNS = %s
@@ -126,10 +149,7 @@ PublicKey = %s
 AllowedIPs = 0.0.0.0/0, ::/0
 Endpoint = %s:51820
 `, privateKey, clientIP, strings.Join(cfg.DNS, ", "), server.PublicKey, server.IPv4AddrIn)
-
-	return ModifyWireGuardConfig(cfg, config), nil
 }
-
 func extractKey(configContent, keyName string) string {
 	for _, line := range strings.Split(configContent, "\n") {
 		if strings.HasPrefix(line, keyName) {

@@ -30,7 +30,8 @@ GoGuard is a Go-based VPN client that interfaces with Mullvad's WireGuard server
 
 2. Build the project:
     ```sh
-    go build -o gogguard cmd/main.go
+    go build -o gogguard cmd/goguard/main.go
+
     ```
 
 3. Ensure `wg` and `wg-quick` are installed and accessible in your PATH.

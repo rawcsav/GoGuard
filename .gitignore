@@ -24,6 +24,9 @@ go.work
 config.yaml
 .idea/
 
+./GoGuard
 GoGuard
 
 .DS_Store
+!/cmd/goguard/
+!/cmd/goguard/*
