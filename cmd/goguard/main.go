@@ -96,8 +96,10 @@ func run(lc fx.Lifecycle, logger *zap.Logger, cfg *config.Config, selectedServer
 				return fmt.Errorf("failed to setup routing and DNS: %v", err)
 			}
 
-			go vpn.MonitorConnection(cfg, originalDNS)
+			vpnManager := vpn.NewVPNManager(cfg, logger)
 
+			// Start monitoring VPN connection
+			go vpnManager.MonitorConnection(originalDNS)
 			sigChan := make(chan os.Signal, 1)
 			signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
