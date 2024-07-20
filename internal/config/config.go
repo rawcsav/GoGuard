@@ -2,11 +2,10 @@ package config
 
 import (
 	"GoGuard/internal/detect"
+	"GoGuard/internal/mullvad"
 	"fmt"
 	"github.com/spf13/viper"
 	"io/ioutil"
-	"net/http"
-	"net/url"
 	"os"
 	"os/exec"
 	"strings"
@@ -24,13 +23,6 @@ type Config struct {
 	PostUp                   []string `mapstructure:"post_up"`
 	PreDown                  []string `mapstructure:"pre_down"`
 	PostDown                 []string `mapstructure:"post_down"`
-}
-
-type MullvadServer struct {
-	PublicKey   string
-	IPv4AddrIn  string
-	CountryCode string
-	IPv4Address string
 }
 
 func LoadConfig(configFile string) (*Config, error) {
@@ -115,21 +107,13 @@ func extractPrivateKey(configPath string) (string, error) {
 	return privateKey, nil
 }
 
-func validateKeys(privateKey, publicKey string) error {
-	if len(privateKey) != 44 || len(publicKey) != 44 {
-		return fmt.Errorf("invalid key length")
-	}
-	// Add more validation if necessary
-	return nil
-}
-
 func GenerateWireGuardConfig(cfg *Config, server *detect.MullvadServer) (string, error) {
 	privateKey, publicKey, err := getOrGenerateKeys(cfg.InterfaceName)
 	if err != nil {
 		return "", err
 	}
 
-	clientIP, err := getClientIP(cfg.MullvadAccountNumber, publicKey)
+	clientIP, err := mullvad.GetClientIP(cfg.MullvadAccountNumber, publicKey)
 	if err != nil {
 		return "", fmt.Errorf("failed to get client IP: %v", err)
 	}
@@ -150,6 +134,7 @@ AllowedIPs = 0.0.0.0/0, ::/0
 Endpoint = %s:51820
 `, privateKey, clientIP, strings.Join(cfg.DNS, ", "), server.PublicKey, server.IPv4AddrIn)
 }
+
 func extractKey(configContent, keyName string) string {
 	for _, line := range strings.Split(configContent, "\n") {
 		if strings.HasPrefix(line, keyName) {
@@ -182,36 +167,6 @@ func generatePublicKey(privateKey string) (string, error) {
 	return strings.TrimSpace(string(output)), nil
 }
 
-func getClientIP(accountNumber, publicKey string) (string, error) {
-	apiURL := "https://api.mullvad.net/wg/"
-	data := url.Values{}
-	data.Set("account", accountNumber)
-	data.Set("pubkey", publicKey)
-
-	resp, err := http.PostForm(apiURL, data)
-	if err != nil {
-		return "", fmt.Errorf("failed to send request: %v", err)
-	}
-	defer resp.Body.Close()
-
-	body, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		return "", fmt.Errorf("failed to read response body: %v", err)
-	}
-
-	if resp.StatusCode != http.StatusCreated {
-		return "", fmt.Errorf("failed to fetch server info: status code %d, body: %s", resp.StatusCode, string(body))
-	}
-
-	clientIPs := strings.TrimSpace(string(body))
-	ips := strings.Split(clientIPs, ",")
-	if len(ips) < 1 {
-		return "", fmt.Errorf("no IP addresses received from Mullvad API")
-	}
-
-	ipv4 := strings.Split(ips[0], "/")[0]
-	return ipv4, nil
-}
 func ModifyWireGuardConfig(c *Config, configContent string) string {
 	parts := strings.SplitN(configContent, "[Peer]", 2)
 	if len(parts) != 2 {
